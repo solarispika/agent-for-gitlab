@@ -25,7 +25,7 @@ export interface WebhookPayload {
     id: number;
     note?: string;
     noteable_type?: string;
-  discussion_id?: string;
+    discussion_id?: string;
     author_id: number;
     created_at: string;
     updated_at: string;
@@ -105,5 +105,82 @@ export interface WebhookPayload {
     file_name: string;
     type?: string;
     visibility: string;
+  };
+}
+
+export interface MergeRequestHookPayload {
+  object_kind: "merge_request";
+  event_type: string;
+  user: {
+    id: number;
+    username: string;
+    name: string;
+    email?: string;
+    avatar_url?: string;
+  };
+  project: {
+    id: number;
+    name: string;
+    description?: string;
+    web_url: string;
+    avatar_url?: string;
+    git_ssh_url: string;
+    git_http_url: string;
+    namespace: string;
+    visibility_level: number;
+    path_with_namespace: string;
+    default_branch: string;
+  };
+  object_attributes: {
+    id: number;
+    iid: number;
+    target_branch: string;
+    source_branch: string;
+    source_project_id: number;
+    author_id: number;
+    assignee_id?: number;
+    title: string;
+    created_at: string;
+    updated_at: string;
+    milestone_id?: number;
+    state: string;
+    merge_status: string;
+    target_project_id: number;
+    description?: string;
+    source: {
+      id: number;
+      name: string;
+      path_with_namespace: string;
+      web_url: string;
+    };
+    target: {
+      id: number;
+      name: string;
+      path_with_namespace: string;
+      web_url: string;
+    };
+    last_commit?: {
+      id: string;
+      message: string;
+      title: string;
+      author: {
+        name: string;
+        email: string;
+      };
+    };
+    work_in_progress: boolean;
+    url: string;
+    action: string;
+  };
+  labels?: Array<{
+    id: number;
+    title: string;
+    color: string;
+    description?: string;
+  }>;
+  changes?: {
+    title?: { previous: string; current: string };
+    description?: { previous: string; current: string };
+    labels?: { previous: Array<any>; current: Array<any> };
   };
 }

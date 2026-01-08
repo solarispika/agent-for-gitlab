@@ -11,7 +11,7 @@ import {
 } from "./gitlab";
 import { limitByUser } from "./limiter";
 import { logger } from "./logger";
-import type { WebhookPayload } from "./types";
+import type { WebhookPayload, MergeRequestHookPayload } from "./types";
 
 const app = new Hono();
 
@@ -50,7 +50,7 @@ app.get(
     process.env.AI_DISABLED = "true";
     logger.warn("Bot disabled via admin endpoint");
     return c.text("disabled");
-  }
+  },
 );
 
 app.get(
@@ -60,8 +60,174 @@ app.get(
     process.env.AI_DISABLED = "false";
     logger.info("Bot enabled via admin endpoint");
     return c.text("enabled");
-  }
+  },
 );
+
+// Build auto-review prompt based on project
+function buildAutoReviewPrompt(
+  projectPath: string,
+  mrTitle: string,
+  mrDescription: string | undefined,
+): string {
+  let projectContext = "";
+
+  // Project-specific review guidelines
+  if (projectPath.includes("deepsearch")) {
+    projectContext = `
+PROJECT CONTEXT: This is a Vue.js/TypeScript Electron application.
+- Uses Synology Vue Components (@synology/SynoVueComponents) - check for proper syno-id usage
+- Check for TypeScript type safety (no 'as any', no @ts-ignore)
+- Verify Electron security best practices (no nodeIntegration: true in renderers)
+- Check Vue 3 Composition API patterns`;
+  } else if (projectPath.includes("OrangeDrive")) {
+    projectContext = `
+PROJECT CONTEXT: This is a C++ codebase.
+- Check for memory safety issues (use-after-free, buffer overflows, memory leaks)
+- Verify RAII patterns are used correctly
+- Check for thread safety issues
+- Look for potential null pointer dereferences`;
+  } else if (projectPath.includes("conan-index")) {
+    projectContext = `
+PROJECT CONTEXT: This is a Conan package index.
+- Verify dependency versions are pinned
+- Check for known vulnerabilities in dependencies
+- Ensure proper recipe structure`;
+  }
+
+  return `You are reviewing a merge request.
+
+MR Title: ${mrTitle}
+MR Description: ${mrDescription || "(no description)"}
+${projectContext}
+
+Please review the code changes in this MR. Focus on:
+1. Potential bugs or logic errors
+2. Security vulnerabilities
+3. Performance issues
+4. Code style and best practices
+5. Missing error handling
+
+Provide constructive feedback as a GitLab comment. Be specific about line numbers and files when pointing out issues.
+If the code looks good, acknowledge it briefly and mention any minor suggestions.`;
+}
+
+// Handle Merge Request Hook for auto-review
+async function handleMergeRequestHook(c: any, body: MergeRequestHookPayload) {
+  const action = body.object_attributes.action;
+  const projectId = body.project.id;
+  const projectPath = body.project.path_with_namespace;
+  const mrIid = body.object_attributes.iid;
+  const mrTitle = body.object_attributes.title;
+  const mrDescription = body.object_attributes.description;
+  const sourceBranch = body.object_attributes.source_branch;
+  const authorUsername = body.user.username;
+
+  // Only trigger on MR open (not update, merge, close, etc.)
+  if (action !== "open") {
+    logger.debug("Ignoring MR action", { action });
+    return c.text("ignored");
+  }
+
+  // Check if auto-review is enabled
+  if (process.env.AUTO_REVIEW_ENABLED !== "true") {
+    logger.debug("Auto-review disabled");
+    return c.text("auto-review-disabled");
+  }
+
+  if (process.env.AI_DISABLED === "true") {
+    logger.warn("Bot is disabled, skipping auto-review");
+    return c.text("disabled");
+  }
+
+  // Skip if MR author is the bot itself
+  if (process.env.AI_GITLAB_USERNAME === authorUsername) {
+    logger.debug("Ignoring self-created MR");
+    return c.text("self-trigger");
+  }
+
+  // Skip draft/WIP MRs
+  if (
+    body.object_attributes.work_in_progress ||
+    mrTitle.toLowerCase().startsWith("draft:") ||
+    mrTitle.toLowerCase().startsWith("wip:")
+  ) {
+    logger.debug("Skipping draft/WIP MR", { mrTitle });
+    return c.text("draft-skipped");
+  }
+
+  logger.info("Auto-review triggered for new MR", {
+    project: projectPath,
+    mrIid,
+    mrTitle,
+    author: authorUsername,
+  });
+
+  // Build the review prompt
+  const reviewPrompt = buildAutoReviewPrompt(
+    projectPath,
+    mrTitle,
+    mrDescription,
+  );
+
+  // Create minimal webhook payload for CI/CD variable
+  const minimalPayload = {
+    object_kind: "merge_request",
+    project: body.project,
+    user: body.user,
+    object_attributes: {
+      iid: mrIid,
+      title: mrTitle,
+      state: body.object_attributes.state,
+      action: action,
+    },
+  };
+
+  const variables = {
+    AI_TRIGGER: "true",
+    AI_AUTHOR: authorUsername,
+    AI_GITLAB_EMAIL: process.env.AI_GITLAB_EMAIL || "",
+    AI_GITLAB_USERNAME: process.env.AI_GITLAB_USERNAME || "",
+    AI_RESOURCE_TYPE: "merge_request",
+    AI_RESOURCE_ID: String(mrIid),
+    AI_PROJECT_PATH: projectPath,
+    AI_BRANCH: sourceBranch,
+    AI_DISCUSSION_ID: "",
+    OPENCODE_MODEL: process.env.OPENCODE_MODEL || "anthropic/claude-sonnet-4",
+    OPENCODE_AGENT_PROMPT: process.env.OPENCODE_AGENT_PROMPT || "",
+    TRIGGER_PHRASE: process.env.TRIGGER_PHRASE || "@ai",
+    DIRECT_PROMPT: reviewPrompt,
+    GITLAB_WEBHOOK_PAYLOAD: JSON.stringify(minimalPayload),
+  };
+
+  try {
+    const pipelineId = await triggerPipeline(
+      projectId,
+      sourceBranch,
+      variables,
+      mrIid,
+    );
+
+    logger.info("Auto-review pipeline triggered", {
+      pipelineId,
+      projectId,
+      mrIid,
+      sourceBranch,
+    });
+
+    if (process.env.CANCEL_OLD_PIPELINES === "true") {
+      await cancelOldPipelines(projectId, pipelineId, sourceBranch);
+    }
+
+    return c.json({ status: "auto-review-started", pipelineId, mrIid });
+  } catch (error) {
+    logger.error("Failed to trigger auto-review pipeline", {
+      error: error instanceof Error ? error.message : error,
+      projectId,
+      mrIid,
+    });
+    return c.json({ error: "Failed to trigger auto-review" }, 500);
+  }
+}
 
 // Single webhook endpoint for all projects
 app.post("/webhook", async (c) => {
@@ -77,6 +243,12 @@ app.post("/webhook", async (c) => {
   if (gitlabToken !== process.env.WEBHOOK_SECRET) {
     logger.warn("Webhook unauthorized - invalid token");
     return c.text("unauthorized", 401);
+  }
+
+  // Handle Merge Request Hook for auto-review
+  if (gitlabEvent === "Merge Request Hook") {
+    const body = await c.req.json<MergeRequestHookPayload>();
+    return handleMergeRequestHook(c, body);
   }
 
   // Only handle Note Hook events
@@ -105,7 +277,7 @@ app.post("/webhook", async (c) => {
   const triggerPhrase = process.env.TRIGGER_PHRASE || "@ai";
   const triggerRegex = new RegExp(
     `${triggerPhrase.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`,
-    "i"
+    "i",
   );
 
   // Check for trigger phrase mention
@@ -185,8 +357,8 @@ app.post("/webhook", async (c) => {
   const promptMatch = note.match(
     new RegExp(
       `${triggerPhrase.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s+(.*)`,
-      "is"
-    )
+      "is",
+    ),
   );
 
   const directPrompt = promptMatch ? promptMatch[1].trim() : "";
@@ -293,7 +465,7 @@ app.post("/webhook", async (c) => {
       projectId,
       ref,
       variables,
-      mrIid ?? undefined
+      mrIid ?? undefined,
     );
 
     logger.info("Pipeline triggered successfully", {

@@ -1,0 +1,23 @@
+ai_agent:
+  stage: ai
+  image: ${AI_AGENT_IMAGE:-ghcr.io/schickli/ai-code-for-gitlab/agent-image:latest}
+  tags:
+    - docker
+  before_script:
+    - git config --global user.name "${AI_GITLAB_USERNAME:-ai-reviewer}"
+    - git config --global user.email "${AI_GITLAB_EMAIL:-ai-reviewer@synology.com}"
+    - git config --global credential.helper store
+    - |
+      if [ -n "$GITLAB_TOKEN" ]; then
+        echo "https://gitlab-ci-token:${GITLAB_TOKEN}@${CI_SERVER_HOST}" >> ~/.git-credentials
+        chmod 600 ~/.git-credentials
+      fi
+  script: |
+    echo "AI Review - Type: ${AI_RESOURCE_TYPE}, ID: ${AI_RESOURCE_ID}"
+    opencode --model "${OPENCODE_MODEL}" --prompt "${DIRECT_PROMPT}"
+  rules:
+    - if: '$AI_TRIGGER == "true"'
+  variables:
+    GIT_STRATEGY: clone
+    GIT_DEPTH: 0
+  allow_failure: true

@@ -1,0 +1,12 @@
+version: "3.8"
+
+services:
+  gitlab-app:
+    build: .
+    ports:
+      - "${PORT:-3000}:${PORT:-3000}"
+    env_file:
+      - .env
+    environment:
+      - RATE_LIMITING_ENABLED=false
+    restart: unless-stopped
